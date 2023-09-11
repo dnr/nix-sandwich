@@ -1,4 +1,4 @@
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import <nixpkgs> { } }:
 rec {
   src = {
     pname = "nix-sandwich";
@@ -33,11 +33,18 @@ rec {
     ];
   });
 
+  # Patch zstd to add --dict-stream-size.
+  withStreamPatch = zstd: (zstd.overrideAttrs (old: {
+    patches = old.patches ++ [ ./zstd-streaming-dict.patch ];
+  })).override { buildContrib = false; doCheck = false; };
+  zstdStream = withStreamPatch pkgs.zstd;
+  zstdStreamStatic = withStreamPatch pkgs.pkgsStatic.zstd;
+
   # Use static binaries and take only the main binaries to make the image as
   # small as possible:
   zstdStaticBin = pkgs.stdenv.mkDerivation {
     name = "zstd-binonly";
-    src = pkgs.pkgsStatic.zstd;
+    src = zstdStreamStatic;
     installPhase = "mkdir -p $out/bin && cp $src/bin/zstd $out/bin/";
   };
   xzStaticBin = pkgs.stdenv.mkDerivation {
@@ -63,5 +70,23 @@ rec {
       User = "1000:1000";
       Cmd = [ "${nix-sandwich-image}/bin/nix-sandwich" ];
     };
+  };
+
+  shell = pkgs.mkShell {
+    buildInputs = with pkgs; [
+      awscli2
+      go
+      gzip
+      jq
+      nix
+      skopeo
+      terraform
+      xdelta
+      xz
+      zstdStream
+      # for cbrotli:
+      brotli.dev
+      gcc
+    ];
   };
 }

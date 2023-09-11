@@ -1,0 +1,24 @@
+#!/bin/sh
+
+a=$1
+b=$2
+asz=$(nix-store -q --size $a)
+bsz=$(nix-store -q --size $b)
+
+nix-store --dump $b | \
+tee >(wc -c 1>&2) | \
+tee >(sha1sum 1>&2) | \
+zstd \
+  -c \
+  --dict-stream-size=$asz \
+  --stream-size=$bsz \
+  --patch-from=<(nix-store --dump $a) \
+  | \
+tee >(wc -c 1>&2) | \
+zstd \
+  -cd \
+  --dict-stream-size=$asz \
+  --patch-from=<(nix-store --dump $a) \
+  | \
+tee >(wc -c 1>&2) | \
+sha1sum

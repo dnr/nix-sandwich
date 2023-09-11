@@ -1,0 +1,143 @@
+diff --git a/programs/fileio.c b/programs/fileio.c
+index 21723254..56f8cd3d 100644
+--- a/programs/fileio.c
++++ b/programs/fileio.c
+@@ -300,6 +300,7 @@ FIO_prefs_t* FIO_createPreferences(void)
+     ret->ldmBucketSizeLog = FIO_LDM_PARAM_NOTSET;
+     ret->ldmHashRateLog = FIO_LDM_PARAM_NOTSET;
+     ret->streamSrcSize = 0;
++    ret->dictStreamSrcSize = 0;
+     ret->targetCBlockSize = 0;
+     ret->srcSizeHint = 0;
+     ret->testMode = 0;
+@@ -409,6 +410,10 @@ void FIO_setStreamSrcSize(FIO_prefs_t* const prefs, size_t streamSrcSize) {
+     prefs->streamSrcSize = streamSrcSize;
+ }
+ 
++void FIO_setDictStreamSrcSize(FIO_prefs_t* const prefs, size_t dictStreamSrcSize) {
++    prefs->dictStreamSrcSize = dictStreamSrcSize;
++}
++
+ void FIO_setTargetCBlockSize(FIO_prefs_t* const prefs, size_t targetCBlockSize) {
+     prefs->targetCBlockSize = targetCBlockSize;
+ }
+@@ -688,10 +693,6 @@ static void FIO_getDictFileStat(const char* fileName, stat_t* dictFileStat) {
+     if (!UTIL_stat(fileName, dictFileStat)) {
+         EXM_THROW(31, "Stat failed on dictionary file %s: %s", fileName, strerror(errno));
+     }
+-
+-    if (!UTIL_isRegularFileStat(dictFileStat)) {
+-        EXM_THROW(32, "Dictionary %s must be a regular file.", fileName);
+-    }
+ }
+ 
+ /*  FIO_setDictBufferMalloc() :
+@@ -719,7 +720,7 @@ static size_t FIO_setDictBufferMalloc(FIO_Dict_t* dict, const char* fileName, FI
+         EXM_THROW(33, "Couldn't open dictionary %s: %s", fileName, strerror(errno));
+     }
+ 
+-    fileSize = UTIL_getFileSizeStat(dictFileStat);
++    fileSize = UTIL_isFIFOStat(dictFileStat) ? prefs->dictStreamSrcSize : UTIL_getFileSizeStat(dictFileStat);
+     {
+         size_t const dictSizeMax = prefs->patchFromMode ? prefs->memLimit : DICTSIZE_MAX;
+         if (fileSize >  dictSizeMax) {
+@@ -1124,11 +1125,20 @@ static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
+                     strerror(errno));
+ 
+     FIO_getDictFileStat(dictFileName, &ress.dictFileStat);
++    int const dictIsFIFO = UTIL_isFIFOStat(&ress.dictFileStat);
++    forceNoUseMMap |= dictIsFIFO;
+ 
+     /* need to update memLimit before calling createDictBuffer
+      * because of memLimit check inside it */
+     if (prefs->patchFromMode) {
+-        U64 const dictSize = UTIL_getFileSizeStat(&ress.dictFileStat);
++        U64 dictSize;
++        if (dictIsFIFO) {
++            dictSize = prefs->dictStreamSrcSize;
++            if (dictSize == 0)
++                EXM_THROW(32, "Dictionary %s must be a regular file or provide --dict-stream-size.", dictFileName);
++        } else {
++            dictSize = UTIL_getFileSizeStat(&ress.dictFileStat);
++        }
+         unsigned long long const ssSize = (unsigned long long)prefs->streamSrcSize;
+         useMMap |= dictSize > prefs->memLimit;
+         FIO_adjustParamsForPatchFromMode(prefs, &comprParams, dictSize, ssSize > 0 ? ssSize : maxSrcFileSize, cLevel);
+@@ -2226,9 +2236,18 @@ static dRess_t FIO_createDResources(FIO_prefs_t* const prefs, const char* dictFi
+     memset(&ress, 0, sizeof(ress));
+ 
+     FIO_getDictFileStat(dictFileName, &statbuf);
++    int const dictIsFIFO = UTIL_isFIFOStat(&statbuf);
++    forceNoUseMMap |= dictIsFIFO;
+ 
+-    if (prefs->patchFromMode){
+-        U64 const dictSize = UTIL_getFileSizeStat(&statbuf);
++    if (prefs->patchFromMode) {
++        U64 dictSize;
++        if (dictIsFIFO) {
++            dictSize = prefs->dictStreamSrcSize;
++            if (dictSize == 0)
++                EXM_THROW(32, "Dictionary %s must be a regular file or provide --dict-stream-size.", dictFileName);
++        } else {
++            dictSize = UTIL_getFileSizeStat(&statbuf);
++        }
+         useMMap |= dictSize > prefs->memLimit;
+         FIO_adjustMemLimitForPatchFromMode(prefs, dictSize, 0 /* just use the dict size */);
+     }
+diff --git a/programs/fileio_types.h b/programs/fileio_types.h
+index 2994a609..02b77215 100644
+--- a/programs/fileio_types.h
++++ b/programs/fileio_types.h
+@@ -50,6 +50,7 @@ typedef struct FIO_prefs_s {
+     int ldmBucketSizeLog;
+     int ldmHashRateLog;
+     size_t streamSrcSize;
++    size_t dictStreamSrcSize;
+     size_t targetCBlockSize;
+     int srcSizeHint;
+     int testMode;
+diff --git a/programs/zstdcli.c b/programs/zstdcli.c
+index 66952aa8..1b09cad9 100644
+--- a/programs/zstdcli.c
++++ b/programs/zstdcli.c
+@@ -244,6 +244,7 @@ static void usage_advanced(const char* programName)
+     DISPLAYOUT("  --exclude-compressed          Only compress files that are not already compressed.\n\n");
+ 
+     DISPLAYOUT("  --stream-size=#               Specify size of streaming input from STDIN.\n");
++    DISPLAYOUT("  --dict-stream-size=#          Specify size of streaming dictionary from a named pipe.\n");
+     DISPLAYOUT("  --size-hint=#                 Optimize compression parameters for streaming input of approximately size #.\n");
+     DISPLAYOUT("  --target-compressed-block-size=#\n");
+     DISPLAYOUT("                                Generate compressed blocks of approximately # size.\n\n");
+@@ -881,6 +882,7 @@ int main(int argCount, const char* argv[])
+     unsigned maxDictSize = g_defaultMaxDictSize;
+     unsigned dictID = 0;
+     size_t streamSrcSize = 0;
++    size_t dictStreamSrcSize = 0;
+     size_t targetCBlockSize = 0;
+     size_t srcSizeHint = 0;
+     size_t nbInputFileNames = 0;
+@@ -1058,6 +1060,7 @@ int main(int argCount, const char* argv[])
+                 if (longCommandWArg(&argument, "--dictID")) { NEXT_UINT32(dictID); continue; }
+                 if (longCommandWArg(&argument, "--zstd=")) { if (!parseCompressionParameters(argument, &compressionParams)) { badusage(programName); CLEAN_RETURN(1); } ; cType = FIO_zstdCompression; continue; }
+                 if (longCommandWArg(&argument, "--stream-size")) { NEXT_TSIZE(streamSrcSize); continue; }
++                if (longCommandWArg(&argument, "--dict-stream-size")) { NEXT_TSIZE(dictStreamSrcSize); continue; }
+                 if (longCommandWArg(&argument, "--target-compressed-block-size")) { NEXT_TSIZE(targetCBlockSize); continue; }
+                 if (longCommandWArg(&argument, "--size-hint")) { NEXT_TSIZE(srcSizeHint); continue; }
+                 if (longCommandWArg(&argument, "--output-dir-flat")) {
+@@ -1528,6 +1531,7 @@ int main(int argCount, const char* argv[])
+     FIO_setAllowBlockDevices(prefs, allowBlockDevices);
+     FIO_setPatchFromMode(prefs, patchFromDictFileName != NULL);
+     FIO_setMMapDict(prefs, mmapDict);
++    FIO_setDictStreamSrcSize(prefs, dictStreamSrcSize);
+     if (memLimit == 0) {
+         if (compressionParams.windowLog == 0) {
+             memLimit = (U32)1 << g_defaultMaxWindowLog;
+@@ -1587,7 +1591,7 @@ int main(int argCount, const char* argv[])
+         /* these variables are only used when compression mode is enabled */
+         (void)contentSize; (void)suffix; (void)adapt; (void)rsyncable;
+         (void)ultra; (void)cLevel; (void)ldmFlag; (void)literalCompressionMode;
+-        (void)targetCBlockSize; (void)streamSrcSize; (void)srcSizeHint;
++        (void)targetCBlockSize; (void)streamSrcSize; (void)dictStreamSrcSize; (void)srcSizeHint;
+         (void)ZSTD_strategyMap; (void)useRowMatchFinder; (void)cType;
+         DISPLAYLEVEL(1, "Compression not supported \n");
+ #endif
