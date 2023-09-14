@@ -12,14 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/nix-community/go-nix/pkg/narinfo"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
 )
 
 type (
@@ -37,10 +33,9 @@ type (
 	}
 
 	differServer struct {
-		cfg      *config
-		diskSem  *semaphore.Weighted
-		dlSem    *semaphore.Weighted
-		deltaSem *semaphore.Weighted
+		cfg *config
+		// dlSem    *semaphore.Weighted
+		// deltaSem *semaphore.Weighted
 	}
 
 	differHeader struct {
@@ -59,15 +54,14 @@ type (
 var errNotFound = errors.New("not found")
 
 func newDifferServer(cfg *config) *differServer {
-	// roughly, each download will use some network plus an xz process,
-	// and each delta will use an xdelta3/zstd process.
-	// so effectively this will allow about 2×cpus processes to run.
-	concurrency := int64(runtime.NumCPU())
+	// // roughly, each download will use some network plus an xz process,
+	// // and each delta will use an xdelta3/zstd process.
+	// // so effectively this will allow about 2×cpus processes to run.
+	// concurrency := int64(runtime.NumCPU())
 	return &differServer{
-		cfg:      cfg,
-		diskSem:  semaphore.NewWeighted(getTempDirFreeBytes()),
-		dlSem:    semaphore.NewWeighted(concurrency),
-		deltaSem: semaphore.NewWeighted(concurrency),
+		cfg: cfg,
+		// dlSem:    semaphore.NewWeighted(concurrency),
+		// deltaSem: semaphore.NewWeighted(concurrency),
 	}
 }
 
@@ -109,61 +103,30 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 		return http.StatusBadRequest, "unknown algo", nil
 	}
 
-	// times two because we need base + requested and we expect them to be about the same size
-	size := req.ReqNarSize * 2
-	if err := d.diskSem.Acquire(r.Context(), size); err != nil {
-		return http.StatusInsufficientStorage, "disk semaphore", err
-	}
-	defer d.diskSem.Release(size)
-
 	// download base + req nar
-	var baseNar, reqNar string
-	var g errgroup.Group
-	var baseSize int
 	expFilter, _ := getNarFilter(d.cfg, &req)
 
-	g.Go(func() error {
-		if err := d.dlSem.Acquire(r.Context(), 1); err != nil {
-			return err
-		}
-		defer d.dlSem.Release(1)
+	reqNar, reqSize, reqClose, err := d.streamNar(
+		req.Upstream, req.ReqName, req.ReqNarPath, req.ReqNarSize, expFilter)
+	if err != nil {
+		return http.StatusInternalServerError, "nar start download error", err
+	}
+	defer reqClose()
 
-		var err error
-		reqNar, err = d.downloadNar(req.Upstream, req.ReqName, req.ReqNarPath, expFilter)
-		return err
-	})
-	g.Go(func() error {
-		if err := d.dlSem.Acquire(r.Context(), 1); err != nil {
-			return err
-		}
-		defer d.dlSem.Release(1)
-
-		var err error
-		hash, _, _ := strings.Cut(path.Base(req.BaseStorePath), "-")
-		baseNar, err = d.downloadNarFromInfo(req.Upstream, hash, expFilter)
-		if err == nil {
-			if st, e := os.Stat(baseNar); e == nil {
-				baseSize = int(st.Size())
-			}
-		}
-		return err
-	})
-
-	err := g.Wait()
-	defer os.Remove(baseNar)
-	defer os.Remove(reqNar)
-
+	hash, _, _ := strings.Cut(path.Base(req.BaseStorePath), "-")
+	baseNar, baseSize, baseClose, err := d.streamNarFromInfo(req.Upstream, hash, expFilter)
 	if err != nil {
 		if err == errNotFound {
-			return http.StatusNotFound, "nar download error", err
+			return http.StatusNotFound, "base nar download error", err
 		}
-		return http.StatusInternalServerError, "nar download error", err
+		return http.StatusInternalServerError, "base nar download error", err
 	}
+	defer baseClose()
 
-	if d.deltaSem.Acquire(r.Context(), 1) != nil {
-		return http.StatusInternalServerError, "canceled", nil
-	}
-	defer d.deltaSem.Release(1)
+	// if d.deltaSem.Acquire(r.Context(), 1) != nil {
+	// 	return http.StatusInternalServerError, "canceled", nil
+	// }
+	// defer d.deltaSem.Release(1)
 
 	// TODO: consider a quick check on delta-bility before we do it for real,
 	// to save computation/bandwidth
@@ -188,20 +151,25 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 	bw, err := mpw.CreateFormFile(differBodyName, "delta")
 
 	stats, algoErr := algo.Create(r.Context(), CreateArgs{
-		Base:    baseNar,
-		Request: reqNar,
-		Output:  bw,
+		Base:        baseNar,
+		BaseSize:    baseSize,
+		Request:     reqNar,
+		RequestSize: reqSize,
+		Output:      bw,
 	})
+
+	// make sure downloads finished cleanly
+	joinErr := errors.Join(reqClose(), baseClose(), algoErr)
 
 	var t differTrailer
 
-	if algoErr != nil {
+	if joinErr != nil {
 		t.Ok = false
-		t.Error = algoErr.Error()
+		t.Error = joinErr.Error()
 	} else {
 		t.Ok = true
 		t.Stats = stats
-		t.Stats.BaseSize = baseSize
+		t.Stats.BaseSize = int(baseSize)
 	}
 
 	// write trailer
@@ -213,32 +181,26 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 	return 0, t.Stats.String(), algoErr
 }
 
-func (d *differServer) downloadNar(upstream, reqName, narPath string, narFilter readerFilter) (retPath string, retErr error) {
+func (d *differServer) streamNar(
+	upstream, reqName, narPath string,
+	size int64,
+	narFilter readerFilter,
+) (r io.Reader, sizeOut int64, close func() error, retErr error) {
 	fileHash := path.Base(narPath)
 	compression := path.Ext(fileHash)
-	fileHash = strings.TrimSuffix(fileHash, compression)
 
 	start := time.Now()
 	u := url.URL{Scheme: "http", Host: upstream, Path: "/" + narPath}
 	res, err := http.Get(u.String())
 	if err != nil {
 		log.Print("download http error: ", err, " for ", u.String())
-		return "", err
+		return nil, 0, nil, err
 	}
-	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		log.Print("download http status: ", res.Status, " for ", u.String())
-		return "", fmt.Errorf("http error %s", res.Status)
+		res.Body.Close()
+		return nil, 0, nil, fmt.Errorf("http error %s", res.Status)
 	}
-
-	f, err := os.CreateTemp("", "nar")
-	name := f.Name()
-	defer func() {
-		if retErr != nil {
-			os.Remove(name)
-		}
-	}()
-	defer f.Close()
 
 	var decompress *exec.Cmd
 	switch compression {
@@ -249,50 +211,50 @@ func (d *differServer) downloadNar(upstream, reqName, narPath string, narFilter 
 	case ".zst":
 		decompress = exec.Command(zstdBin, "-d")
 	default:
-		return "", fmt.Errorf("unknown compression %q", compression)
+		return nil, 0, nil, fmt.Errorf("unknown compression %q", compression)
 	}
-	decompress.Stdin = res.Body
-	filterErrCh := make(chan error, 1)
-	if narFilter == nil {
-		decompress.Stdout = f
-		filterErrCh <- nil
-	} else {
-		pr, err := decompress.StdoutPipe()
-		if err != nil {
-			return "", err
-		}
-		expanded := narFilter(pr)
-		go func() { filterErrCh <- ioCopy(f, expanded, nil, -1) }()
+	cr := countReader{r: res.Body}
+	decompress.Stdin = &cr
+	r, err = decompress.StdoutPipe()
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if narFilter != nil {
+		r = narFilter(r)
 	}
 	decompress.Stderr = os.Stderr
 	if err = decompress.Start(); err != nil {
 		log.Print("download decompress start error: ", err)
-		return "", err
+		return nil, 0, nil, err
 	}
-	filterErr := <-filterErrCh
-	if err = decompress.Wait(); err != nil {
-		log.Print("download decompress error: ", err)
-		return "", err
+	// TODO: can we wrap r in a ReadCloser such that Close does this but it's still actually
+	// an *os.File for efficient piping?
+	close = func() error {
+		if decompress.ProcessState != nil {
+			return nil // already called
+		}
+		if err = decompress.Wait(); err != nil {
+			log.Print("download decompress error: ", err)
+			return err
+		}
+		elapsed := time.Since(start)
+		ps := decompress.ProcessState
+		log.Printf("downloaded %s [%d bytes] in %s [decmp %s user, %s sys]: %.3f MB/s",
+			reqName, cr.c, elapsed, ps.UserTime(), ps.SystemTime(),
+			float64(size)/elapsed.Seconds()/1e6,
+		)
+		res.Body.Close()
+		return nil
 	}
-	if filterErr != nil {
-		log.Print("download filter error: ", err)
-		return "", err
-	}
-	var size int64
-	if st, err := f.Stat(); err == nil {
-		size = st.Size()
-	}
-
-	elapsed := time.Since(start)
-	ps := decompress.ProcessState
-	log.Printf("downloaded %s [%d bytes] in %s [decmp %s user, %s sys]: %.3f MB/s",
-		reqName, size, elapsed, ps.UserTime(), ps.SystemTime(),
-		float64(size)/elapsed.Seconds()/1e6,
-	)
-	return name, nil
+	// FIXME FIXME FIXME: size is wrong if we used narFilter!
+	sizeOut = size
+	return
 }
 
-func (d *differServer) downloadNarFromInfo(upstream, storePathHash string, narFilter readerFilter) (string, error) {
+func (d *differServer) streamNarFromInfo(
+	upstream, storePathHash string,
+	narFilter readerFilter,
+) (io.Reader, int64, func() error, error) {
 	u := url.URL{
 		Scheme: "http",
 		Host:   upstream,
@@ -301,21 +263,27 @@ func (d *differServer) downloadNarFromInfo(upstream, storePathHash string, narFi
 	us := u.String()
 	res, err := http.Get(us)
 	if err != nil {
-		return "", err
+		return nil, 0, nil, err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
 		if res.StatusCode == http.StatusNotFound {
-			return "", errNotFound
+			return nil, 0, nil, errNotFound
 		}
-		return "", fmt.Errorf("http error %s", res.Status)
+		return nil, 0, nil, fmt.Errorf("http error %s", res.Status)
 	}
 	ni, err := narinfo.Parse(res.Body)
 	if err != nil {
-		return "", err
+		return nil, 0, nil, err
 	}
-	return d.downloadNar(upstream, ni.StorePath[44:], ni.URL, narFilter)
+	return d.streamNar(
+		upstream,
+		ni.StorePath[44:],
+		ni.URL,
+		int64(ni.NarSize),
+		narFilter,
+	)
 }
 
 func writeJsonField(mpw *multipart.Writer, name string, v any) error {
@@ -324,15 +292,6 @@ func writeJsonField(mpw *multipart.Writer, name string, v any) error {
 		return err
 	}
 	return json.NewEncoder(w).Encode(v)
-}
-
-func getTempDirFreeBytes() int64 {
-	t := os.TempDir()
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(t, &st); err != nil {
-		panic(err)
-	}
-	return int64(st.Bfree) * st.Bsize * 9 / 10
 }
 
 func getNarFilter(cfg *config, req *differRequest) (readerFilter, readerFilter) {

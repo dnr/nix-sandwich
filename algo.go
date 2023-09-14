@@ -26,16 +26,18 @@ type (
 	}
 
 	CreateArgs struct {
-		// TODO: consider *os.File or io.Reader instead?
-		Base    string
-		Request string
-		Output  io.Writer
+		Base        io.Reader
+		BaseSize    int64
+		Request     io.Reader
+		RequestSize int64
+		Output      io.Writer
 	}
 
 	ExpandArgs struct {
-		Base   io.Reader
-		Delta  io.Reader
-		Output io.Writer
+		Base     io.Reader
+		BaseSize int
+		Delta    io.Reader
+		Output   io.Writer
 	}
 
 	xd3Algo struct{ level int }
@@ -53,18 +55,22 @@ func (a *xd3Algo) Create(ctx context.Context, args CreateArgs) (*DiffStats, erro
 		"-v",                        // verbose
 		fmt.Sprintf("-%d", a.level), // level
 		"-S", "lzma",                // secondary compression
-		"-A",            // disable header
-		"-D",            // disable compression detection
-		"-c",            // stdout
-		"-e",            // encode
-		"-s", args.Base, // base
-		args.Request,
+		"-A",              // disable header
+		"-D",              // disable compression detection
+		"-c",              // stdout
+		"-e",              // encode
+		"-s", "/dev/fd/3", // base
+		"/dev/stdin",
 	)
 	cw := countWriter{w: args.Output}
+	xdelta.Stdin = args.Request
 	xdelta.Stdout = &cw
 	xdeltaErrPipe, err := xdelta.StderrPipe()
 	if err != nil {
 		return nil, fmt.Errorf("xdelta stderr pipe: %w", err)
+	}
+	xdelta.ExtraFiles = []*os.File{ // TODO: handle non-File
+		args.Base.(*os.File),
 	}
 
 	if err = xdelta.Start(); err != nil {
@@ -82,7 +88,7 @@ func (a *xd3Algo) Create(ctx context.Context, args CreateArgs) (*DiffStats, erro
 
 	stats := &DiffStats{
 		DiffSize:   cw.c,
-		NarSize:    fileSize(args.Request),
+		NarSize:    int(args.RequestSize),
 		Algo:       a.Name(),
 		Level:      a.level,
 		CmpTotalMs: time.Now().Sub(start).Milliseconds(),
@@ -164,14 +170,19 @@ func (a *zstAlgo) Create(ctx context.Context, args CreateArgs) (*DiffStats, erro
 		fmt.Sprintf("-%d", a.level), // level
 		"--single-thread",           // improve compression (sometimes?)
 		"-c",                        // stdout
-		"--patch-from", args.Base,   // base
-		args.Request,
+		fmt.Sprintf("--dict-stream-size=%d", args.BaseSize),
+		"--patch-from=/dev/fd/3", // base
+		fmt.Sprintf("--stream-size=%d", args.RequestSize),
 	)
+	zstd.Stdin = args.Request
 	cw := countWriter{w: args.Output}
 	zstd.Stdout = &cw
 	zstdErrPipe, err := zstd.StderrPipe()
 	if err != nil {
 		return nil, fmt.Errorf("zstd stderr pipe: %w", err)
+	}
+	zstd.ExtraFiles = []*os.File{ // TODO: handle non-File
+		args.Base.(*os.File),
 	}
 
 	if err = zstd.Start(); err != nil {
@@ -189,7 +200,7 @@ func (a *zstAlgo) Create(ctx context.Context, args CreateArgs) (*DiffStats, erro
 
 	stats := &DiffStats{
 		DiffSize:   cw.c,
-		NarSize:    fileSize(args.Request),
+		NarSize:    int(args.RequestSize),
 		Algo:       a.Name(),
 		Level:      a.level,
 		CmpTotalMs: time.Now().Sub(start).Milliseconds(),
@@ -200,19 +211,6 @@ func (a *zstAlgo) Create(ctx context.Context, args CreateArgs) (*DiffStats, erro
 }
 
 func (_ *zstAlgo) Expand(ctx context.Context, args ExpandArgs) (*DiffStats, error) {
-	// zstd requires physical file :(
-	baseFile, err := os.CreateTemp("", "basenar")
-	if err != nil {
-		return nil, err
-	}
-	defer os.Remove(baseFile.Name())
-
-	err = ioCopy(baseFile, args.Base, nil, -1)
-	baseFile.Close()
-	if err != nil {
-		return nil, err
-	}
-
 	start := time.Now()
 	zstd := exec.CommandContext(
 		ctx,
@@ -220,8 +218,8 @@ func (_ *zstAlgo) Expand(ctx context.Context, args ExpandArgs) (*DiffStats, erro
 		"--long=30", // allow more memory (1GB)
 		"-c",        // stdout
 		"-d",        // decode
-		"--patch-from",
-		baseFile.Name(), // base
+		fmt.Sprintf("--dict-stream-size=%d", args.BaseSize),
+		"--patch-from=/dev/fd/3",
 	)
 	zstd.Stdin = args.Delta // exec automatically creates pipe + copy goroutine
 	zstd.Stdout = args.Output
@@ -229,6 +227,10 @@ func (_ *zstAlgo) Expand(ctx context.Context, args ExpandArgs) (*DiffStats, erro
 	if err != nil {
 		return nil, fmt.Errorf("zstd stderr pipe: %w", err)
 	}
+	zstd.ExtraFiles = []*os.File{ // TODO: handle non-File
+		args.Base.(*os.File),
+	}
+
 	if zstd.Start(); err != nil {
 		return nil, fmt.Errorf("zstd start error: %w", err)
 	}
@@ -286,9 +288,13 @@ func (c *countWriter) Write(p []byte) (n int, err error) {
 	return c.w.Write(p)
 }
 
-func fileSize(fn string) int {
-	if fi, err := os.Stat(fn); err == nil {
-		return int(fi.Size())
-	}
-	return 0
+type countReader struct {
+	r io.Reader
+	c int
+}
+
+func (c *countReader) Read(p []byte) (n int, err error) {
+	n, err = c.r.Read(p)
+	c.c += n
+	return
 }
