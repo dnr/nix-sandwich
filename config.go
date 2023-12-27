@@ -16,7 +16,8 @@ type (
 		CatalogUpdateFreq time.Duration `env:"nix_sandwich_catalog_update_freq=1h"`
 		DiffAlgo          string        `env:"nix_sandwich_diff_algo=zstd-3,xdelta-1"`
 		MinFileSize       int           `env:"nix_sandwich_min_file_size=16384"`
-		MaxFileSize       int           `env:"nix_sandwich_max_file_size=1073741824"` // 1 GiB
+		MaxFileSize       int           `env:"nix_sandwich_max_file_size=681574400"` // 650MiB
+		MaxNarSize        int           `env:"nix_sandwich_max_nar_size=1073741824"` // 1GiB
 		RunSubstituter    bool          `env:"nix_sandwich_run_substituter=true"`
 		RunDiffer         bool          `env:"nix_sandwich_run_differ=false"`
 		AnalyticsFile     string        `env:"nix_sandwich_analytics_file=default"` // empty string to disable

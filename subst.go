@@ -323,9 +323,9 @@ func (s *subst) getNarInfoCommon(
 	if err != nil {
 		return nil, http.StatusInternalServerError, "nixpath parse error", err
 	}
-	if int(ni.FileSize) < s.cfg.MinFileSize || int(ni.FileSize) > s.cfg.MaxFileSize {
+	if int(ni.FileSize) < s.cfg.MinFileSize || int(ni.FileSize) > s.cfg.MaxFileSize || int(ni.NarSize) > s.cfg.MaxNarSize {
 		code := failedTooSmall
-		if int(ni.FileSize) > s.cfg.MaxFileSize {
+		if int(ni.FileSize) > s.cfg.MaxFileSize || int(ni.NarSize) > s.cfg.MaxNarSize {
 			code = failedTooBig
 		}
 		s.writeAnalytics(AnRecord{
@@ -338,7 +338,7 @@ func (s *subst) getNarInfoCommon(
 			},
 		})
 		// too small or too big, pretend we don't have it
-		msg := fmt.Sprintf("%s is too %s (%d)", np.Name, code[4:], ni.FileSize)
+		msg := fmt.Sprintf("%s is too %s (%d)", np.Name, code[3:], ni.FileSize)
 		return nil, http.StatusNotFound, msg, nil
 	}
 
