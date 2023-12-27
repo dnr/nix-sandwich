@@ -12,7 +12,7 @@ type (
 		Upstream          string        `env:"nix_sandwich_upstream=cache.nixos.org"`
 		Differ            string        `env:"nix_sandwich_differ=http://localhost:7420"`
 		DifferBind        string        `env:"nix_sandwich_differ_bind=:7420"`
-		SubstituterBind   string        `env:"nix_sandwich_substituter_bind=localhost:7419"`
+		SubstituterBind   string        `env:"nix_sandwich_substituter_bind=127.0.0.1:7419"`
 		CatalogUpdateFreq time.Duration `env:"nix_sandwich_catalog_update_freq=1h"`
 		DiffAlgo          string        `env:"nix_sandwich_diff_algo=zstd-3,xdelta-1"`
 		MinFileSize       int           `env:"nix_sandwich_min_file_size=16384"`
@@ -23,6 +23,7 @@ type (
 		AnalyticsFile     string        `env:"nix_sandwich_analytics_file=default"` // empty string to disable
 		NarExpBufferEnt   int           `env:"nix_sandwich_nar_expander_buffer_entries"`
 		NarExpBufferBytes int64         `env:"nix_sandwich_nar_expander_buffer_bytes"`
+		SubstIdleTime     time.Duration `env:"nix_sandwich_subst_idle_time"`
 	}
 )
 

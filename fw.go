@@ -6,9 +6,15 @@ import (
 )
 
 type fwHandler func(w http.ResponseWriter, r *http.Request) (status int, msg string, err error)
+type fwAlive func()
 
-func fw(f fwHandler) func(w http.ResponseWriter, r *http.Request) {
+func fw(f fwHandler, alive fwAlive) func(w http.ResponseWriter, r *http.Request) {
+	if alive == nil {
+		alive = func() {}
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		alive()
+		defer alive()
 		log.Print(r.Method, " ", r.URL.Path)
 		status, msg, err := f(w, r)
 		if err == nil {

@@ -73,7 +73,7 @@ func newDifferServer(cfg *config) *differServer {
 
 func (d *differServer) getHander() http.Handler {
 	h := http.NewServeMux()
-	h.HandleFunc(differPath, fw(d.differ))
+	h.HandleFunc(differPath, fw(d.differ, nil))
 	return h
 }
 
@@ -98,6 +98,7 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 		req.Upstream = d.cfg.Upstream
 	}
 	// TODO: should we do this?
+	// Will need to sign requests now, see https://discourse.nixos.org/t/34697
 	// if req.Upstream == "cache.nixos.org" && os.Getenv("AWS_REGION") == "us-east-1" {
 	// 	// If we're in us-east-1, prefer S3 directly since it's free.
 	// 	req.Upstream = "nix-cache.s3.amazonaws.com"

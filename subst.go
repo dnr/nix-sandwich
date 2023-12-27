@@ -19,8 +19,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/coreos/go-systemd/v22/activation"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/golang/groupcache/lru"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"github.com/nix-community/go-nix/pkg/nixbase32"
@@ -38,6 +41,7 @@ type (
 		catalog *catalog
 		nisem   *semaphore.Weighted
 		nsem    *semaphore.Weighted
+		lastReq atomic.Int64
 
 		analytics *os.File
 
@@ -65,11 +69,37 @@ func newLocalSubstituter(cfg *config, catalog *catalog) *subst {
 
 func (s *subst) serve() error {
 	h := http.NewServeMux()
-	h.HandleFunc("/nix-cache-info", fw(s.getCacheInfo))
-	h.HandleFunc("/log/", fw(s.getLog))
-	h.HandleFunc("/nar/", fw(s.getNar))
-	h.HandleFunc("/", fw(s.getNarInfo))
-	return http.ListenAndServe(":7419", h)
+	h.HandleFunc("/nix-cache-info", fw(s.getCacheInfo, s.alive))
+	h.HandleFunc("/log/", fw(s.getLog, s.alive))
+	h.HandleFunc("/nar/", fw(s.getNar, s.alive))
+	h.HandleFunc("/", fw(s.getNarInfo, s.alive))
+
+	listeners, err := activation.Listeners()
+	if err != nil {
+		panic(err)
+	}
+	if len(listeners) == 0 {
+		// not using socket activation
+		return http.ListenAndServe(s.cfg.SubstituterBind, h)
+	}
+
+	if s.cfg.SubstIdleTime > 0 {
+		go s.exitOnIdle()
+	}
+	daemon.SdNotify(true, daemon.SdNotifyReady)
+	return http.Serve(listeners[0], h)
+}
+
+func (s *subst) exitOnIdle() {
+	for range time.NewTicker(time.Minute).C {
+		if time.Since(time.Unix(s.lastReq.Load(), 0)) > s.cfg.SubstIdleTime {
+			os.Exit(0)
+		}
+	}
+}
+
+func (s *subst) alive() {
+	s.lastReq.Store(time.Now().Unix())
 }
 
 func (s *subst) getCacheInfo(w http.ResponseWriter, r *http.Request) (int, string, error) {
