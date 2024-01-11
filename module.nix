@@ -44,6 +44,7 @@ in with lib; {
       description = "nix download helper";
       serviceConfig.ExecStart = "${cfg.package}/bin/nix-sandwich";
       serviceConfig.Type = "notify";
+      serviceConfig.NotifyAccess = "all";
       serviceConfig.DynamicUser = true;
       serviceConfig.LogsDirectory = "nix-sandwich-analytics";
       serviceConfig.TemporaryFileSystem = "/tmpfs:size=16G,mode=1777"; # force tmpfs
