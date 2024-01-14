@@ -154,33 +154,69 @@ func (s *subst) getNar(w http.ResponseWriter, r *http.Request) (int, string, err
 	return s.getNarCommon(r.Context(), recent, w)
 }
 
-func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (int, string, error) {
+func (s *subst) getDiff(ctx context.Context, recent *recent) (body io.Reader, finish func() error, algo DiffAlgo, retErr error) {
+	// check cache first
+	if len(s.cfg.CacheReadURL) > 0 {
+		// first algo only
+		tryAlgo := recent.request.AcceptAlgos[0]
+
+		algo = getAlgo(tryAlgo)
+		if algo == nil {
+			return nil, nil, nil, fmt.Errorf("unknown algo %q", tryAlgo)
+		}
+
+		key := cacheKey(&recent.request, tryAlgo)
+		u, err := url.Parse(s.cfg.CacheReadURL)
+		if err != nil {
+			panic(err)
+		}
+		u.Path = path.Join(u.Path, key)
+
+		req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			if res.StatusCode == http.StatusOK {
+				return res.Body, res.Body.Close, algo, nil // cache hit
+			}
+			// http success but no hit, ignore body and fall through to differ
+			io.Copy(io.Discard, res.Body)
+			res.Body.Close()
+		}
+	}
+
 	// make diff request
 	buf, err := json.Marshal(recent.request)
 	if err != nil {
-		return http.StatusInternalServerError, "json marshal error", err
+		return nil, nil, nil, fmt.Errorf("json marshal error: %w", err)
 	}
 	u := makeDifferUrl(s.cfg.Differ)
 	postReq, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(buf))
 	if err != nil {
-		return http.StatusInternalServerError, "create req", err
+		return nil, nil, nil, fmt.Errorf("create req: %w", err)
 	}
 	postReq.Header.Set("Content-Type", "application/json")
 	res, err := http.DefaultClient.Do(postReq)
 	if err != nil {
-		return http.StatusInternalServerError, "differ http error", err
+		return nil, nil, nil, fmt.Errorf("differ http error: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() {
+		if retErr != nil {
+			res.Body.Close()
+		}
+	}()
 
 	if res.StatusCode != http.StatusOK {
 		// TODO: on some/most errors, fall back to proxying from upstream cache directly
-		return res.StatusCode, "differ http status", errors.New(res.Status)
+		return nil, nil, nil, fmt.Errorf("differ http status %s", res.Status)
 	}
 
 	// parse multipart
 	boundary, err := getBoundary(res)
 	if err != nil {
-		return http.StatusInternalServerError, "parse multipart", err
+		return nil, nil, nil, fmt.Errorf("parse multipart: %w", err)
 	}
 	mpr := multipart.NewReader(res.Body, boundary)
 
@@ -188,25 +224,53 @@ func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (
 	hr, err := mpr.NextPart()
 	var h differHeader
 	if err != nil {
-		return http.StatusInternalServerError, "parse multipart header", err
+		return nil, nil, nil, fmt.Errorf("parse multipart header: %w", err)
 	} else if hr.FormName() != differHeaderName {
-		return http.StatusInternalServerError, "parse multipart header wrong name", nil
+		return nil, nil, nil, fmt.Errorf("parse multipart header wrong name")
 	} else if err = json.NewDecoder(hr).Decode(&h); err != nil {
-		return http.StatusInternalServerError, "parse multipart header json", err
+		return nil, nil, nil, fmt.Errorf("parse multipart header json: %w", err)
 	}
 
-	algo := getAlgo(h.Algo)
+	algo = getAlgo(h.Algo)
 	if algo == nil {
-		return http.StatusInternalServerError, "unknown algo", nil
+		return nil, nil, nil, fmt.Errorf("unknown algo %q", h.Algo)
 	}
 
 	// set up for reading body
 	br, err := mpr.NextRawPart()
 	if err != nil {
-		return http.StatusInternalServerError, "parse multipart body", err
+		return nil, nil, nil, fmt.Errorf("parse multipart body: %w", err)
 	} else if br.FormName() != differBodyName {
-		return http.StatusInternalServerError, "parse multipart body wrong name", nil
+		return nil, nil, nil, fmt.Errorf("parse multipart body wrong name")
 	}
+
+	finish = func() error {
+		defer res.Body.Close()
+		tr, err := mpr.NextPart()
+		var t differTrailer
+		if err != nil {
+			return fmt.Errorf("parse multipart trailer: %w", err)
+		} else if tr.FormName() != differTrailerName {
+			return fmt.Errorf("parse multipart trailer wrong name")
+		} else if err = json.NewDecoder(tr).Decode(&t); err != nil {
+			return fmt.Errorf("parse multipart trailer json: %w", err)
+		} else if _, err = mpr.NextPart(); err != io.EOF {
+			return fmt.Errorf("parse multipart trailing parts")
+		} else if !t.Ok {
+			return fmt.Errorf("differ error: %s", t.Error)
+		}
+		return nil
+	}
+
+	return br, finish, algo, nil
+}
+
+func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (int, string, error) {
+	diffReaderInternal, finish, algo, err := s.getDiff(ctx, recent)
+	if err != nil {
+		return http.StatusInternalServerError, "", err
+	}
+	diffReader := countReader{r: diffReaderInternal}
 
 	// get base nar
 
@@ -243,7 +307,7 @@ func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (
 	// run algo
 	expandStats, err := algo.Expand(procCtx, ExpandArgs{
 		Base:   basePipe,
-		Delta:  br,
+		Delta:  &diffReader,
 		Output: output,
 	})
 	if err != nil {
@@ -260,26 +324,22 @@ func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (
 	}
 
 	// read trailer
-	tr, err := mpr.NextPart()
-	var t differTrailer
+	err = finish()
 	if err != nil {
-		return http.StatusInternalServerError, "parse multipart trailer", err
-	} else if tr.FormName() != differTrailerName {
-		return http.StatusInternalServerError, "parse multipart trailer wrong name", nil
-	} else if err = json.NewDecoder(tr).Decode(&t); err != nil {
-		return http.StatusInternalServerError, "parse multipart trailer json", err
-	} else if _, err = mpr.NextPart(); err != io.EOF {
-		return http.StatusInternalServerError, "parse multipart trailing parts", nil
+		return http.StatusInternalServerError, "", err
 	}
 
-	if !t.Ok {
-		return http.StatusInternalServerError, "", errors.New("trailer ok false")
+	recent.stats = &DiffStats{
+		BaseSize: int(recent.request.BaseNarSize),
+		DiffSize: diffReader.c,
+		NarSize:  int(recent.request.ReqNarSize),
+		Algo:     algo.Name(),
+		Level:    0, // TODO: get level
+		// TODO: get cmp stats in here
+		ExpTotalMs: expandStats.ExpTotalMs,
+		ExpUserMs:  expandStats.ExpUserMs,
+		ExpSysMs:   expandStats.ExpSysMs,
 	}
-
-	recent.stats = t.Stats.nonnil()
-	recent.stats.ExpTotalMs = expandStats.ExpTotalMs
-	recent.stats.ExpUserMs = expandStats.ExpUserMs
-	recent.stats.ExpSysMs = expandStats.ExpSysMs
 
 	s.writeAnalytics(AnRecord{
 		D: &AnDiff{

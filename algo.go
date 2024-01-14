@@ -286,6 +286,17 @@ func (c *countWriter) Write(p []byte) (n int, err error) {
 	return c.w.Write(p)
 }
 
+type countReader struct {
+	r io.Reader
+	c int
+}
+
+func (c *countReader) Read(p []byte) (n int, err error) {
+	n, err = c.r.Read(p)
+	c.c += n
+	return
+}
+
 func fileSize(fn string) int {
 	if fi, err := os.Stat(fn); err == nil {
 		return int(fi.Size())
