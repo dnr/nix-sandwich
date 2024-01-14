@@ -86,14 +86,14 @@ func (d *differServer) serve() error {
 	return srv.ListenAndServe()
 }
 
-func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus int, retMsg string, retErr error) {
+func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retErr error) {
 	if r.Method != "POST" {
-		return http.StatusMethodNotAllowed, "", nil
+		return fwErr(http.StatusMethodNotAllowed, "")
 	}
 
 	var req differRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return http.StatusBadRequest, "json decode error", err
+		return fwErr(http.StatusBadRequest, "json decode error: %w", err)
 	}
 	if req.Upstream == "" {
 		req.Upstream = d.cfg.Upstream
@@ -108,13 +108,13 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 	// TODO: pick algo based on size or other properties?
 	algo := pickAlgo(req.AcceptAlgos)
 	if algo == nil {
-		return http.StatusBadRequest, "unknown algo", nil
+		return fwErr(http.StatusBadRequest, "unknown algo %q", req.AcceptAlgos)
 	}
 
 	// times two because we need base + requested and we expect them to be about the same size
 	size := req.ReqNarSize * 2
 	if err := d.diskSem.Acquire(r.Context(), size); err != nil {
-		return http.StatusInsufficientStorage, "disk semaphore", err
+		return fwErr(http.StatusInsufficientStorage, "disk semaphore: %w", err)
 	}
 	defer d.diskSem.Release(size)
 
@@ -157,13 +157,13 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 
 	if err != nil {
 		if err == errNotFound {
-			return http.StatusNotFound, "nar download error", err
+			return fwErr(http.StatusNotFound, "nar download error: %w", err)
 		}
-		return http.StatusInternalServerError, "nar download error", err
+		return fwErr(http.StatusInternalServerError, "nar download error: %w", err)
 	}
 
 	if d.deltaSem.Acquire(r.Context(), 1) != nil {
-		return http.StatusInternalServerError, "canceled", nil
+		return fwErr(http.StatusInternalServerError, "canceled")
 	}
 	defer d.deltaSem.Release(1)
 
@@ -183,7 +183,7 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 	var h differHeader
 	h.Algo = algo.Name()
 	if err := writeJsonField(mpw, differHeaderName, h); err != nil {
-		return http.StatusInternalServerError, "multipart write header", err
+		return fwErr(http.StatusInternalServerError, "multipart write header: %w", err)
 	}
 
 	// write body
@@ -209,10 +209,15 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retStatus
 	// write trailer
 	err = writeJsonField(mpw, differTrailerName, t)
 	if err != nil {
-		return http.StatusInternalServerError, "multipart write trailer", err
+		return fwErr(http.StatusInternalServerError, "multipart write trailer: %w", err)
 	}
 
-	return 0, t.Stats.String(), algoErr
+	if algoErr != nil {
+		return fwErr(http.StatusInternalServerError, "algo error: %w", algoErr)
+	}
+
+	// return stats as zero "error" for the log
+	return fwErr(0, "%s", t.Stats.String())
 }
 
 func (d *differServer) downloadNar(upstream, reqName, narPath string, narFilter readerFilter) (retPath string, retErr error) {

@@ -102,13 +102,13 @@ func (s *subst) alive() {
 	s.lastReq.Store(time.Now().Unix())
 }
 
-func (s *subst) getCacheInfo(w http.ResponseWriter, r *http.Request) (int, string, error) {
+func (s *subst) getCacheInfo(w http.ResponseWriter, r *http.Request) error {
 	if r.Method != "GET" {
-		return http.StatusMethodNotAllowed, "", nil
+		return fwErr(http.StatusMethodNotAllowed, "")
 	}
 	w.Header().Add("Content-Type", "text/x-nix-cache-info")
 	fmt.Fprintf(w, "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 10\n")
-	return 0, "", nil
+	return nil
 }
 
 func (s *subst) getRecent(narbasename string) *recent {
@@ -127,27 +127,27 @@ func (s *subst) putRecent(narbasename string, r *recent) {
 	s.recentsLock.Unlock()
 }
 
-func (s *subst) getLog(w http.ResponseWriter, r *http.Request) (int, string, error) {
-	return http.StatusNotFound, "", nil
+func (s *subst) getLog(w http.ResponseWriter, r *http.Request) error {
+	return fwErr(http.StatusNotFound, "")
 }
 
-func (s *subst) getNar(w http.ResponseWriter, r *http.Request) (int, string, error) {
+func (s *subst) getNar(w http.ResponseWriter, r *http.Request) error {
 	if r.Method != "GET" {
-		return http.StatusMethodNotAllowed, "", nil
+		return fwErr(http.StatusMethodNotAllowed, "")
 	}
 
 	dir, narbasename := path.Split(r.URL.Path)
 	if dir != "/nar/" || !strings.HasSuffix(narbasename, ".nar") {
-		return http.StatusNotFound, "", nil
+		return fwErr(http.StatusNotFound, "")
 	}
 
 	recent := s.getRecent(narbasename)
 	if recent == nil {
-		return http.StatusNotFound, "no recent found", nil
+		return fwErr(http.StatusNotFound, "no recent found")
 	}
 
 	if s.nsem.Acquire(r.Context(), 1) != nil {
-		return http.StatusInternalServerError, "canceled", nil
+		return fwErr(http.StatusInternalServerError, "canceled")
 	}
 	defer s.nsem.Release(1)
 
@@ -265,10 +265,10 @@ func (s *subst) getDiff(ctx context.Context, recent *recent) (body io.Reader, fi
 	return br, finish, algo, nil
 }
 
-func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (int, string, error) {
+func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) error {
 	diffReaderInternal, finish, algo, err := s.getDiff(ctx, recent)
 	if err != nil {
-		return http.StatusInternalServerError, "", err
+		return fwErrE(http.StatusInternalServerError, err)
 	}
 	diffReader := countReader{r: diffReaderInternal}
 
@@ -281,12 +281,12 @@ func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (
 	var basePipe io.Reader
 	basePipe, err = writeNar.StdoutPipe()
 	if err != nil {
-		return http.StatusInternalServerError, "pipe error", err
+		return fwErr(http.StatusInternalServerError, "pipe error: %w", err)
 	}
 	writeNar.Stderr = os.Stderr
 	err = writeNar.Start()
 	if err != nil {
-		return http.StatusInternalServerError, "base dump error", err
+		return fwErr(http.StatusInternalServerError, "base dump error: %w", err)
 	}
 	defer writeNar.Wait()
 
@@ -311,22 +311,22 @@ func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (
 		Output: output,
 	})
 	if err != nil {
-		return http.StatusInternalServerError, "diff algo error", err
+		return fwErr(http.StatusInternalServerError, "diff algo error: %w", err)
 	}
 
 	filterErr := <-filterErrCh
 
 	// this should also be done now
 	if err = writeNar.Wait(); err != nil {
-		return http.StatusInternalServerError, "base dump error", err
+		return fwErr(http.StatusInternalServerError, "base dump error: %w", err)
 	} else if filterErr != nil {
-		return http.StatusInternalServerError, "nar filter error", filterErr
+		return fwErr(http.StatusInternalServerError, "nar filter error: %w", filterErr)
 	}
 
 	// read trailer
 	err = finish()
 	if err != nil {
-		return http.StatusInternalServerError, "", err
+		return fwErrE(http.StatusInternalServerError, err)
 	}
 
 	recent.stats = &DiffStats{
@@ -348,32 +348,33 @@ func (s *subst) getNarCommon(ctx context.Context, recent *recent, w io.Writer) (
 		},
 	})
 
-	return 0, recent.stats.String(), nil
+	// return stats as zero "error" for the log
+	return fwErr(0, "%s", recent.stats.String())
 }
 
-func (s *subst) getNarInfo(w http.ResponseWriter, r *http.Request) (int, string, error) {
+func (s *subst) getNarInfo(w http.ResponseWriter, r *http.Request) error {
 	if r.Method != "GET" && r.Method != "HEAD" {
-		return http.StatusMethodNotAllowed, "", nil
+		return fwErr(http.StatusMethodNotAllowed, "")
 	}
 	m := reInfo.FindStringSubmatch(r.URL.Path)
 	if m == nil {
-		return http.StatusNotFound, "", nil
+		return fwErr(http.StatusNotFound, "")
 	}
 	hash, tp := m[1], m[2]
 	head := r.Method == "HEAD"
 
 	// don't support listings
 	if tp == "ls" {
-		return http.StatusNotFound, "", nil
+		return fwErr(http.StatusNotFound, "")
 	}
 
 	if s.nisem.Acquire(r.Context(), 1) != nil {
-		return http.StatusInternalServerError, "canceled", nil
+		return fwErr(http.StatusInternalServerError, "canceled")
 	}
 	defer s.nisem.Release(1)
 
-	_, status, msg, err := s.getNarInfoCommon(r.Context(), hash, head, w)
-	return status, msg, err
+	_, err := s.getNarInfoCommon(r.Context(), hash, head, w)
+	return err
 }
 
 func (s *subst) getNarInfoCommon(
@@ -381,17 +382,17 @@ func (s *subst) getNarInfoCommon(
 	hash string,
 	head bool,
 	w http.ResponseWriter,
-) (*recent, int, string, error) {
+) (*recent, error) {
 	reqid := newId()
 
 	// check upstream
 	res, err := s.makeUpstreamRequest(ctx, hash, head)
 	if err != nil {
-		return nil, http.StatusInternalServerError, "upstream http error", err
+		return nil, fwErr(http.StatusInternalServerError, "upstream http error: %w", err)
 	}
 	defer res.Body.Close()
 	if head {
-		return nil, res.StatusCode, "", nil
+		return nil, fwErr(res.StatusCode, "")
 	}
 	if isNotFound(res.StatusCode) {
 		s.writeAnalytics(AnRecord{
@@ -401,17 +402,17 @@ func (s *subst) getNarInfoCommon(
 				Failed:       failedNotFound,
 			},
 		})
-		return nil, res.StatusCode, "upstream not found", errors.New(res.Status)
+		return nil, fwErr(res.StatusCode, "upstream not found: %s", res.Status)
 	} else if res.StatusCode != http.StatusOK {
-		return nil, res.StatusCode, "upstream http status", errors.New(res.Status)
+		return nil, fwErr(res.StatusCode, "upstream http status: %s", res.Status)
 	}
 	ni, err := narinfo.Parse(res.Body)
 	if err != nil {
-		return nil, http.StatusInternalServerError, "narinfo parse error", err
+		return nil, fwErr(http.StatusInternalServerError, "narinfo parse error: %w", err)
 	}
 	np, err := nixpath.FromString(ni.StorePath)
 	if err != nil {
-		return nil, http.StatusInternalServerError, "nixpath parse error", err
+		return nil, fwErr(http.StatusInternalServerError, "nixpath parse error: %w", err)
 	}
 	if int(ni.FileSize) < s.cfg.MinFileSize || int(ni.FileSize) > s.cfg.MaxFileSize || int(ni.NarSize) > s.cfg.MaxNarSize {
 		code := failedTooSmall
@@ -428,8 +429,7 @@ func (s *subst) getNarInfoCommon(
 			},
 		})
 		// too small or too big, pretend we don't have it
-		msg := fmt.Sprintf("%s is too %s (%d)", np.Name, code[3:], ni.FileSize)
-		return nil, http.StatusNotFound, msg, nil
+		return nil, fwErr(http.StatusNotFound, "%s is too %s (%d)", np.Name, code[3:], ni.FileSize)
 	}
 
 	// see if we have any reasonable base
@@ -450,7 +450,7 @@ func (s *subst) getNarInfoCommon(
 				Failed:       code,
 			},
 		})
-		return nil, http.StatusNotFound, "", err
+		return nil, fwErrE(http.StatusNotFound, err)
 	}
 
 	// new url for uncompressed nar
@@ -496,21 +496,23 @@ func (s *subst) getNarInfoCommon(
 		},
 	})
 
-	return recent, 0, "", nil
+	return recent, nil
 }
 
 func (s *subst) request(ctx context.Context, req string) (*DiffStats, error) {
 	// req should be store name (without /nix/store)
 	hash, _, _ := strings.Cut(req, "-")
 
-	recent, status, msg, err := s.getNarInfoCommon(ctx, hash, false, nil)
-	if err != nil || status != 0 {
-		return nil, fmt.Errorf("get narinfo %s: %d %s: %w", req, status, msg, err)
+	recent, err := s.getNarInfoCommon(ctx, hash, false, nil)
+	if err != nil {
+		if ewc := err.(*errWithStatus); ewc != nil && ewc.status > 0 {
+			return nil, fmt.Errorf("get narinfo %s: %d %w", req, ewc.status, ewc.error)
+		}
 	}
 	out := &countWriter{w: io.Discard}
-	status, msg, err = s.getNarCommon(ctx, recent, out)
-	if err != nil || status != 0 {
-		return nil, fmt.Errorf("get nar %s: %d %s: %w", req, status, msg, err)
+	err = s.getNarCommon(ctx, recent, out)
+	if ewc := err.(*errWithStatus); ewc != nil && ewc.status > 0 {
+		return nil, fmt.Errorf("get nar %s: %d %w", req, ewc.status, ewc.error)
 	}
 	// fmt.Printf("%s: %d bytes\n", req, out.c)
 	return recent.stats, nil
