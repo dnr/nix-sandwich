@@ -32,8 +32,9 @@ type (
 		Upstream      string   `json:"upstream,omitempty"`
 
 		// informational only:
-		ReqNarSize int64  `json:"reqNarSize"` // size of requested nar (used for resource control)
-		ReqName    string `json:"reqName"`    // requested (name only, no hash) (used for log)
+		BaseNarSize int64  `json:"baseNarSize"` // size of base nar
+		ReqNarSize  int64  `json:"reqNarSize"`  // size of requested nar (used for resource control)
+		ReqName     string `json:"reqName"`     // requested (name only, no hash) (used for log)
 	}
 
 	differServer struct {

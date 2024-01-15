@@ -36,6 +36,12 @@ type (
 		seed       maphash.Seed
 	}
 
+	catalogResult struct {
+		storePath string
+		narFilter string
+		narSize   int64
+	}
+
 	reList []*regexp.Regexp
 )
 
@@ -170,12 +176,12 @@ func (c *catalog) signerHash(sigName string) uint32 {
 	return uint32(maphash.String(c.seed, sigName))
 }
 
-func (c *catalog) findBase(ni *narinfo.NarInfo, req string) (string, string, error) {
+func (c *catalog) findBase(ni *narinfo.NarInfo, req string) (catalogResult, error) {
 	if len(req) < 3 {
-		return "", "", errors.New("name too short")
+		return catalogResult{}, errors.New("name too short")
 	} else if req == "source" {
 		// TODO: need contents similarity for this one
-		return "", "", errors.New("can't handle 'source'")
+		return catalogResult{}, errors.New("can't handle 'source'")
 	}
 
 	reqSys := c.sysChecker.getSysFromNarInfo(ni)
@@ -229,7 +235,7 @@ func (c *catalog) findBase(ni *narinfo.NarInfo, req string) (string, string, err
 		})
 
 	if best.rest == "" {
-		return "", "", errors.New("no base found for " + req)
+		return catalogResult{}, errors.New("no base found for " + req)
 	}
 
 	var narFilter, filterMsg string
@@ -241,7 +247,11 @@ func (c *catalog) findBase(ni *narinfo.NarInfo, req string) (string, string, err
 	log.Printf("catalog found base for %s -> %s%s", req, best.rest, filterMsg)
 	hash := nixbase32.EncodeToString(best.hash[:])
 	storePath := nixpath.StoreDir + "/" + hash + "-" + best.rest
-	return storePath, narFilter, nil
+	return catalogResult{
+		storePath: storePath,
+		narFilter: narFilter,
+		narSize:   int64(best.narSize),
+	}, nil
 }
 
 func findDashes(s string) []int {

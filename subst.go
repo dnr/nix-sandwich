@@ -373,10 +373,10 @@ func (s *subst) getNarInfoCommon(
 	}
 
 	// see if we have any reasonable base
-	base, narFilter, err := s.catalog.findBase(ni, np.Name)
-	if err != nil || base[11:43] == hash {
+	base, err := s.catalog.findBase(ni, np.Name)
+	if err != nil || base.storePath[11:43] == hash {
 		code := failedNoBase
-		if err == nil && base[11:43] == hash {
+		if err == nil && base.storePath[11:43] == hash {
 			// only would happen in simulation, real nix wouldn't request this
 			code = failedIdentical
 			err = errors.New("identical")
@@ -401,13 +401,14 @@ func (s *subst) getNarInfoCommon(
 		id: reqid,
 		request: differRequest{
 			ReqNarPath:    ni.URL,
-			BaseStorePath: base,
+			BaseStorePath: base.storePath,
 			AcceptAlgos:   strings.Split(s.cfg.DiffAlgo, ","),
-			NarFilter:     narFilter,
+			NarFilter:     base.narFilter,
 			Upstream:      s.cfg.Upstream,
 
-			ReqNarSize: int64(ni.NarSize),
-			ReqName:    np.Name,
+			BaseNarSize: base.narSize,
+			ReqNarSize:  int64(ni.NarSize),
+			ReqName:     np.Name,
 		},
 	}
 	s.putRecent(path.Base(newUrl), recent)
@@ -428,7 +429,7 @@ func (s *subst) getNarInfoCommon(
 		R: &AnRequest{
 			Id:            reqid,
 			ReqStorePath:  ni.StorePath[len(nixpath.StoreDir)+1:],
-			BaseStorePath: base[len(nixpath.StoreDir)+1:],
+			BaseStorePath: base.storePath[len(nixpath.StoreDir)+1:],
 			NarSize:       ni.NarSize,
 			FileSize:      origFileSize,
 			DifferRequest: &recent.request,
