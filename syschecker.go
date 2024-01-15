@@ -44,6 +44,12 @@ type (
 
 	// path is relative path from root of nar/store directory.
 	presenceFunc func(path string) nar.NodeType
+
+	sysCheckerResult struct {
+		sys     sysType
+		narSize int64
+		signer  string
+	}
 )
 
 var (
@@ -71,8 +77,8 @@ func newSysChecker(cfg *config) *sysChecker {
 	}
 }
 
-func (s *sysChecker) getSysFromStorePathBatch(storePaths []string) (outs []sysType) {
-	outs = make([]sysType, len(storePaths))
+func (s *sysChecker) getSysFromStorePathBatch(storePaths []string) (outs []sysCheckerResult) {
+	outs = make([]sysCheckerResult, len(storePaths))
 	cmd := exec.Command(nixBin, append([]string{"path-info", "--json"}, storePaths...)...)
 	cmd.Stderr = os.Stderr
 	r, err := cmd.StdoutPipe()
@@ -82,10 +88,13 @@ func (s *sysChecker) getSysFromStorePathBatch(storePaths []string) (outs []sysTy
 	if err := cmd.Start(); err != nil {
 		return
 	}
-	var info []struct {
+	type pathInfoItem struct {
 		Path       string   `json:"path"`
 		References []string `json:"references"`
+		NarSize    int64    `json:"narSize"`
+		Signatures []string `json:"signatures"`
 	}
+	var info []*pathInfoItem
 	if err := json.NewDecoder(r).Decode(&info); err != nil {
 		log.Print("syschecker json decode error: ", err)
 		cmd.Wait()
@@ -94,17 +103,23 @@ func (s *sysChecker) getSysFromStorePathBatch(storePaths []string) (outs []sysTy
 	if err := cmd.Wait(); err != nil {
 		return
 	}
-	refMap := make(map[string][]string)
+	refMap := make(map[string]*pathInfoItem)
 	for _, i := range info {
-		refMap[i.Path] = i.References
+		refMap[i.Path] = i
 	}
 	for i, storePath := range storePaths {
-		outs[i] = s.getSysFromPathDeps(
+		item := refMap[storePath]
+		outs[i].sys = s.getSysFromPathDeps(
 			storePath,
-			refMap[storePath],
+			item.References,
 			StoreDirLen+1, // has "/nix/store/"
 			s.localPresence,
 		)
+		outs[i].narSize = item.NarSize
+		// just take first signature for now
+		if len(item.Signatures) > 0 {
+			outs[i].signer, _, _ = strings.Cut(item.Signatures[0], ":")
+		}
 	}
 	return
 }

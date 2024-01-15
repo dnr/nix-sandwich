@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"errors"
+	"hash/maphash"
 	"io"
 	"log"
+	"math"
 	"os"
 	"regexp"
 	"strings"
@@ -19,9 +21,11 @@ import (
 
 type (
 	btItem struct {
-		rest string
-		hash [20]byte
-		sys  sysType
+		rest       string
+		hash       [20]byte
+		sys        sysType
+		narSize    uint32 // max 4GiB, ignore anything larger
+		signerHash uint32 // quick check, collisions are okay
 	}
 
 	catalog struct {
@@ -29,6 +33,7 @@ type (
 		bt  atomic.Value // *btree.BTreeG[btItem]
 
 		sysChecker *sysChecker
+		seed       maphash.Seed
 	}
 
 	reList []*regexp.Regexp
@@ -66,7 +71,7 @@ func itemLess(a, b btItem) bool {
 }
 
 func newCatalog(cfg *config) *catalog {
-	c := &catalog{cfg: cfg, sysChecker: newSysChecker(cfg)}
+	c := &catalog{cfg: cfg, sysChecker: newSysChecker(cfg), seed: maphash.MakeSeed()}
 	c.bt.Store(btree.NewG[btItem](4, itemLess))
 	return c
 }
@@ -147,12 +152,22 @@ outer:
 			}
 		}
 	}
-	if len(storepaths) > 0 {
-		for i, sys := range c.sysChecker.getSysFromStorePathBatch(storepaths) {
-			batch[i].sys = sys
-			nt.ReplaceOrInsert(batch[i])
-		}
+	if len(storepaths) == 0 {
+		return
 	}
+	for i, res := range c.sysChecker.getSysFromStorePathBatch(storepaths) {
+		if res.narSize > math.MaxUint32 || len(res.signer) == 0 {
+			continue
+		}
+		batch[i].sys = res.sys
+		batch[i].narSize = uint32(res.narSize)
+		batch[i].signerHash = c.signerHash(res.signer)
+		nt.ReplaceOrInsert(batch[i])
+	}
+}
+
+func (c *catalog) signerHash(sigName string) uint32 {
+	return uint32(maphash.String(c.seed, sigName))
 }
 
 func (c *catalog) findBase(ni *narinfo.NarInfo, req string) (string, string, error) {
@@ -187,6 +202,11 @@ func (c *catalog) findBase(ni *narinfo.NarInfo, req string) (string, string, err
 		start = req[:dashes[0]+1]
 	}
 
+	var wantSignerHash uint32
+	if len(ni.Signatures) > 0 {
+		wantSignerHash = c.signerHash(ni.Signatures[0].Name)
+	}
+
 	var bestmatch int
 	var best btItem
 
@@ -196,7 +216,9 @@ func (c *catalog) findBase(ni *narinfo.NarInfo, req string) (string, string, err
 		btItem{rest: start},
 		btItem{rest: start + "\xff"},
 		func(i btItem) bool {
-			if i.sys == reqSys && len(findDashes(i.rest)) == len(dashes) {
+			if i.sys == reqSys &&
+				(wantSignerHash == 0 || i.signerHash == wantSignerHash) &&
+				len(findDashes(i.rest)) == len(dashes) {
 				// take last best instead of first since it's probably more recent
 				if match := matchLen(req, i.rest); match >= bestmatch {
 					bestmatch = match
