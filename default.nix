@@ -2,8 +2,8 @@
 rec {
   src = {
     pname = "nix-sandwich";
-    version = "0.0.4";
-    vendorHash = "sha256-XSnuy6VkWh6ygxBXx8WPopaCyD1H3/cv7Fm7RMVmArA=";
+    version = "0.0.5";
+    vendorHash = "sha256-gY6Rna9uwV9l/pcRvVRkry6UCLkZvBfIX9Ozxn2IZKA=";
     src = pkgs.lib.sourceByRegex ./. [ ".*.go" "go.(mod|sum)" ];
   };
 

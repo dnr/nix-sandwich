@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,9 @@ import (
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	s3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -31,7 +35,7 @@ type (
 		NarFilter     string   `json:"narFilter,omitempty"`   // pipe nars through a filter
 		Upstream      string   `json:"upstream,omitempty"`
 
-		// informational only:
+		// informational only (but used for cache key):
 		BaseNarSize int64  `json:"baseNarSize"` // size of base nar
 		ReqNarSize  int64  `json:"reqNarSize"`  // size of requested nar (used for resource control)
 		ReqName     string `json:"reqName"`     // requested (name only, no hash) (used for log)
@@ -42,6 +46,7 @@ type (
 		diskSem  *semaphore.Weighted
 		dlSem    *semaphore.Weighted
 		deltaSem *semaphore.Weighted
+		s3cache  *s3manager.Uploader
 	}
 
 	differHeader struct {
@@ -55,6 +60,11 @@ type (
 	}
 
 	readerFilter func(io.Reader) io.Reader
+
+	teeWriter struct {
+		main  io.Writer
+		other io.Writer
+	}
 )
 
 var errNotFound = errors.New("not found")
@@ -64,11 +74,19 @@ func newDifferServer(cfg *config) *differServer {
 	// and each delta will use an xdelta3/zstd process.
 	// so effectively this will allow about 2×cpus processes to run.
 	concurrency := int64(runtime.NumCPU())
+	var s3cache *s3manager.Uploader
+	if len(cfg.CacheWriteS3Bucket) > 0 {
+		if awscfg, err := awsconfig.LoadDefaultConfig(context.Background()); err == nil {
+			s3client := s3.NewFromConfig(awscfg)
+			s3cache = s3manager.NewUploader(s3client)
+		}
+	}
 	return &differServer{
 		cfg:      cfg,
 		diskSem:  semaphore.NewWeighted(getTempDirFreeBytes()),
 		dlSem:    semaphore.NewWeighted(concurrency),
 		deltaSem: semaphore.NewWeighted(concurrency),
+		s3cache:  s3cache,
 	}
 }
 
@@ -84,6 +102,32 @@ func (d *differServer) serve() error {
 		Handler: d.getHander(),
 	}
 	return srv.ListenAndServe()
+}
+
+func (d *differServer) prepareCacheWriter(req *differRequest, algo string) *io.PipeWriter {
+	if d.s3cache == nil {
+		return nil
+	}
+	key := cacheKey(req, algo)
+	// 5MB * 10k parts can handle objects up to 50GB, which is enough for us
+	pr, pw := io.Pipe()
+	go func() {
+		cc := "public, max-age=31536000"
+		ct := "application/octet-stream"
+		out, err := d.s3cache.Upload(context.Background(), &s3.PutObjectInput{
+			Bucket:       &d.cfg.CacheWriteS3Bucket,
+			Key:          &key,
+			Body:         pr,
+			CacheControl: &cc,
+			ContentType:  &ct,
+		})
+		if err != nil {
+			log.Print("error constructing cache upload: ", err)
+			return
+		}
+		log.Print("uploaded cache object ", out.Location, " in ", len(out.CompletedParts), " parts")
+	}()
+	return pw
 }
 
 func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retErr error) {
@@ -189,11 +233,21 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retErr er
 	// write body
 	bw, err := mpw.CreateFormFile(differBodyName, "delta")
 
+	// get ready to write to cache
+	cacheWriter := d.prepareCacheWriter(&req, algo.Name())
+	if cacheWriter != nil {
+		bw = &teeWriter{main: bw, other: cacheWriter}
+	}
+
 	stats, algoErr := algo.Create(r.Context(), CreateArgs{
 		Base:    baseNar,
 		Request: reqNar,
 		Output:  bw,
 	})
+
+	if cacheWriter != nil {
+		cacheWriter.CloseWithError(algoErr)
+	}
 
 	var t differTrailer
 
@@ -352,4 +406,22 @@ func getNarFilter(cfg *config, req *differRequest) (readerFilter, readerFilter) 
 	default:
 		return nil, nil
 	}
+}
+
+func (tw *teeWriter) Write(p []byte) (n int, err error) {
+	n, err = tw.main.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err == nil && tw.other != nil {
+		n2, err2 := tw.other.Write(p)
+		if err2 == nil && n2 != len(p) {
+			err2 = io.ErrShortWrite
+		}
+		if err2 != nil {
+			log.Print("error writing to cache, aborting: ", err2)
+			tw.other = nil
+		}
+	}
+	return
 }
