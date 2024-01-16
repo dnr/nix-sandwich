@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"strings"
 )
 
 func cacheKey(req *differRequest, algo string) string {
@@ -17,8 +16,7 @@ func cacheKey(req *differRequest, algo string) string {
 	// different nars for the same input hash. (the rest will show up as either errors when
 	// applying the diff, or in the worst case when nix hashes the result.)
 	h.Write([]byte(fmt.Sprintf("sizes=%d,%d\n", req.BaseNarSize, req.ReqNarSize)))
-	// take only base of algo, assume different levels are compatible
-	algo, _, _ = strings.Cut(algo, "-")
+	// note this doesn't include the level:
 	h.Write([]byte(fmt.Sprintf("algo=%s\n", algo)))
 	if len(req.NarFilter) > 0 {
 		h.Write([]byte(fmt.Sprintf("filter=%s\n", req.NarFilter)))

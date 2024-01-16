@@ -53,11 +53,11 @@ func simulate(cfg *config, baseFile, reqFile string) error {
 			defer wg.Done()
 			sem.Acquire(ctx, 1)
 			defer sem.Release(1)
-			if stats, err := subst.request(ctx, req); err != nil {
+			if stats, cached, err := subst.request(ctx, req); err != nil {
 				log.Print(err)
 				errors.Add(1)
 			} else {
-				log.Printf("req %s -> %s", req[33:], stats.String())
+				log.Printf("req %s -> %s %s", req[33:], cached, stats.String())
 				success.Add(1)
 			}
 		}(req)

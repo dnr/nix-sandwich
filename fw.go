@@ -35,17 +35,29 @@ func fw(f fwHandler, alive fwAlive) func(w http.ResponseWriter, r *http.Request)
 	return func(w http.ResponseWriter, r *http.Request) {
 		alive()
 		defer alive()
-		log.Print(r.Method, " ", r.URL.Path, " ...")
+
+		parts := make([]any, 0, 7)
+		parts = append(parts, r.Method, " ", r.URL.Path, " ...")
+		log.Print(parts...)
+
 		err := f(w, r)
+
 		var status int
-		if ewc := err.(*errWithStatus); ewc != nil {
+		if ewc, ok := err.(*errWithStatus); ok {
 			status = ewc.status
 		}
-		if err != nil {
-			log.Print(r.Method, " ", r.URL.Path, " -> ", status, " ", err)
-		} else {
-			log.Print(r.Method, " ", r.URL.Path, status, " OK")
+
+		parts = append(parts[:3], " -> ")
+		if status > 0 {
+			parts = append(parts, status, " ")
 		}
+		if err != nil {
+			parts = append(parts, err)
+		} else {
+			parts = append(parts, "OK")
+		}
+		log.Print(parts...)
+
 		if status > 0 {
 			w.WriteHeader(status)
 		}

@@ -15,6 +15,7 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,8 +78,12 @@ func newDifferServer(cfg *config) *differServer {
 	var s3cache *s3manager.Uploader
 	if len(cfg.CacheWriteS3Bucket) > 0 {
 		if awscfg, err := awsconfig.LoadDefaultConfig(context.Background()); err == nil {
-			s3client := s3.NewFromConfig(awscfg)
+			s3client := s3.NewFromConfig(awscfg, func(o *s3.Options) {
+				o.EndpointOptions.DisableHTTPS = true
+			})
 			s3cache = s3manager.NewUploader(s3client)
+		} else {
+			log.Print("error getting aws config: ", err)
 		}
 	}
 	return &differServer{
@@ -104,14 +109,17 @@ func (d *differServer) serve() error {
 	return srv.ListenAndServe()
 }
 
-func (d *differServer) prepareCacheWriter(req *differRequest, algo string) *io.PipeWriter {
+func (d *differServer) prepareCacheWriter(req *differRequest, algo string) (*io.PipeWriter, func()) {
 	if d.s3cache == nil {
-		return nil
+		return nil, nil
 	}
 	key := cacheKey(req, algo)
 	// 5MB * 10k parts can handle objects up to 50GB, which is enough for us
 	pr, pw := io.Pipe()
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		cc := "public, max-age=31536000"
 		ct := "application/octet-stream"
 		out, err := d.s3cache.Upload(context.Background(), &s3.PutObjectInput{
@@ -127,7 +135,7 @@ func (d *differServer) prepareCacheWriter(req *differRequest, algo string) *io.P
 		}
 		log.Print("uploaded cache object ", out.Location, " in ", len(out.CompletedParts), " parts")
 	}()
-	return pw
+	return pw, wg.Wait
 }
 
 func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retErr error) {
@@ -234,9 +242,10 @@ func (d *differServer) differ(w http.ResponseWriter, r *http.Request) (retErr er
 	bw, err := mpw.CreateFormFile(differBodyName, "delta")
 
 	// get ready to write to cache
-	cacheWriter := d.prepareCacheWriter(&req, algo.Name())
+	cacheWriter, cacheJoin := d.prepareCacheWriter(&req, algo.Name())
 	if cacheWriter != nil {
 		bw = &teeWriter{main: bw, other: cacheWriter}
+		defer cacheJoin()
 	}
 
 	stats, algoErr := algo.Create(r.Context(), CreateArgs{
