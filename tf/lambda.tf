@@ -1,3 +1,6 @@
+
+// iam for lambda:
+
 data "aws_iam_policy_document" "assume_role" {
   statement {
     principals {
@@ -14,9 +17,61 @@ resource "aws_iam_role" "iam_for_lambda" {
   managed_policy_arns = ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
 }
 
+// ecr:
+
 resource "aws_ecr_repository" "repo" {
   name = "nix-sandwich-differ"
 }
+
+// s3:
+
+resource "aws_s3_bucket" "cache" {
+  bucket = "nxsdch-cache-1"
+}
+
+data "aws_iam_policy_document" "cache_bucket_policy" {
+  statement {
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    actions   = ["s3:GetObject"]
+    resources = [aws_s3_bucket.cache.arn, "${aws_s3_bucket.cache.arn}/*"]
+  }
+  statement {
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.iam_for_lambda.arn]
+    }
+    actions   = ["s3:*"]
+    resources = [aws_s3_bucket.cache.arn, "${aws_s3_bucket.cache.arn}/*"]
+  }
+}
+
+resource "aws_s3_bucket_policy" "cache" {
+  bucket = aws_s3_bucket.cache.id
+  policy = data.aws_iam_policy_document.cache_bucket_policy.json
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "cache" {
+  bucket = aws_s3_bucket.cache.id
+  rule {
+    id     = "ttl"
+    status = "Enabled"
+    abort_incomplete_multipart_upload { days_after_initiation = 1 }
+    expiration { days = 7 }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "cache" {
+  bucket                  = aws_s3_bucket.cache.id
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
+// lambda:
 
 variable "differ_image_tag" {}
 
@@ -34,6 +89,12 @@ resource "aws_lambda_function" "differ" {
     size = 2048 # MB
   }
   timeout = 300 # seconds
+  environment {
+    variables = {
+      // must be in the same region:
+      nix_sandwich_cache_write_s3_bucket = aws_s3_bucket.cache.id
+    }
+  }
 }
 
 resource "aws_lambda_function_url" "differ" {
