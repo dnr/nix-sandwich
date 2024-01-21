@@ -12,6 +12,12 @@ in with lib; {
         default = throw "must set config.programs.nix-sandwich.differ!";
         example = "https://abc213";
       };
+      cache = mkOption {
+        description = "url to remote diff cache";
+        type = types.str;
+        default = throw "must set config.programs.nix-sandwich.cache!";
+        example = "https://abc213";
+      };
       port = mkOption {
         description = "port to listen on";
         type = types.int;
@@ -50,6 +56,7 @@ in with lib; {
       serviceConfig.TemporaryFileSystem = "/tmpfs:size=16G,mode=1777"; # force tmpfs
       environment.nix_sandwich_subst_idle_time = "15m";
       environment.nix_sandwich_differ = cfg.differ;
+      environment.nix_sandwich_cache_read_url = cfg.cache;
       environment.TMPDIR = "/tmpfs";
     };
   };
